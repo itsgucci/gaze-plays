@@ -19,9 +19,20 @@ final class GazeController: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
     private let videoQueue = DispatchQueue(label: "lookpause.camera")
     private let rectanglesRequest = VNDetectFaceRectanglesRequest()
     private let landmarksRequest = VNDetectFaceLandmarksRequest()
+    private let sequenceHandler = VNSequenceRequestHandler()
     // Frame processing throttle
     private var lastProcessedAt: Date = .distantPast
-    private let minProcessInterval: TimeInterval = 0.10
+    private let minProcessInterval: TimeInterval = 0.20
+    // Landmark refresh throttle and cached orientation
+    private var lastAnglesAt: Date = .distantPast
+    private let landmarksRefreshInterval: TimeInterval = 1.0
+    private var cachedPitch: Double?
+    private var cachedFacing: Bool = true
+    private var cachedYaw: Double?
+    private var cachedRoll: Double?
+    private var preferPitchMode: Bool = false
+    private var consecutivePitchFrames: Int = 0
+    private let requiredStablePitchFrames: Int = 3
 
     // Smoothing / hysteresis
     private var lastLookingFlip = Date.distantPast
@@ -49,9 +60,10 @@ final class GazeController: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
 
     func start() {
         // Prefer the latest landmarks revision available to improve landmark quality
-        if let latest = VNDetectFaceLandmarksRequest.supportedRevisions.last {
-            landmarksRequest.revision = latest
-        }
+        if let latest = VNDetectFaceLandmarksRequest.supportedRevisions.last { landmarksRequest.revision = latest }
+        if let latestR = VNDetectFaceRectanglesRequest.supportedRevisions.last { rectanglesRequest.revision = latestR }
+        rectanglesRequest.preferBackgroundProcessing = true
+        landmarksRequest.preferBackgroundProcessing = true
         guard setupSession() else { return }
         session.startRunning()
         onStateChanged?(.idle)
@@ -64,14 +76,30 @@ final class GazeController: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
 
     private func setupSession() -> Bool {
         session.beginConfiguration()
-        session.sessionPreset = .vga640x480
+        if session.canSetSessionPreset(.cif352x288) {
+            session.sessionPreset = .cif352x288
+        } else if session.canSetSessionPreset(.vga640x480) {
+            session.sessionPreset = .vga640x480
+        }
 
         guard let cam = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .unspecified),
               let input = try? AVCaptureDeviceInput(device: cam),
               session.canAddInput(input) else { return false }
         session.addInput(input)
+        // Try to reduce FPS to save CPU
+        if let device = input.device as? AVCaptureDevice {
+            do {
+                try device.lockForConfiguration()
+                if device.activeFormat.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= 15 && 15 <= $0.maxFrameRate }) {
+                    device.activeVideoMinFrameDuration = CMTimeMake(value: 1, timescale: 15)
+                    device.activeVideoMaxFrameDuration = CMTimeMake(value: 1, timescale: 15)
+                }
+                device.unlockForConfiguration()
+            } catch { /* ignore */ }
+        }
 
         output.alwaysDiscardsLateVideoFrames = true
+        output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange]
         output.setSampleBufferDelegate(self, queue: videoQueue)
         guard session.canAddOutput(output) else { return false }
         session.addOutput(output)
@@ -83,12 +111,12 @@ final class GazeController: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
         guard isEnabled, let pixel = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        autoreleasepool {
         let now = Date()
         if now.timeIntervalSince(lastProcessedAt) < minProcessInterval { return }
         lastProcessedAt = now
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixel, orientation: .up, options: [:])
         do {
-            try handler.perform([rectanglesRequest])
+            try sequenceHandler.perform([rectanglesRequest], on: pixel, orientation: .up)
         } catch {
             return
         }
@@ -98,32 +126,88 @@ final class GazeController: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
             return
         }
 
-        landmarksRequest.inputFaceObservations = [baseFace]
-        do {
-            try handler.perform([landmarksRequest])
-        } catch {
-            evaluateLooking(false)
-            onDebug?("face: yes | landmarks: error")
-            return
-        }
-        guard let face = landmarksRequest.results?.first else {
-            evaluateLooking(false)
-            onDebug?("face: yes | landmarks: none")
-            return
-        }
-        lastFaceSeen = Date()
+        var vertical: Double = 0
+        var verticalSource = "cached"
+        var yaw: Double? = cachedYaw
+        var roll: Double? = cachedRoll
+        var facing: Bool = cachedFacing
 
-        let facing = headLikelyFacingCamera(face)
-        let (vertical, verticalSource) = computeVerticalMetric(face)
+        // Refresh landmarks only if cache expired or missing
+        let nowAngles = Date()
+        let needLandmarks = (cachedPitch == nil) || (nowAngles.timeIntervalSince(lastAnglesAt) >= landmarksRefreshInterval)
+        if preferPitchMode, let p = baseFace.pitch?.doubleValue {
+            // Use direct pitch from rectangles; skip landmarks entirely
+            cachedPitch = p
+            vertical = p
+            verticalSource = "pitch"
+            yaw = baseFace.yaw?.doubleValue; cachedYaw = yaw
+            roll = baseFace.roll?.doubleValue; cachedRoll = roll
+            if let y = yaw, let r = roll { facing = abs(y) < 0.35 && abs(r) < 0.35 }
+            lastAnglesAt = nowAngles
+            lastFaceSeen = Date()
+            consecutivePitchFrames = min(consecutivePitchFrames + 1, requiredStablePitchFrames)
+        } else if needLandmarks {
+            landmarksRequest.inputFaceObservations = [baseFace]
+            do {
+                try sequenceHandler.perform([landmarksRequest], on: pixel, orientation: .up)
+            } catch {
+                evaluateLooking(false)
+                onDebug?("face: yes | landmarks: error")
+                return
+            }
+            guard let face = landmarksRequest.results?.first else {
+                evaluateLooking(false)
+                onDebug?("face: yes | landmarks: none")
+                return
+            }
+            lastFaceSeen = Date()
+            if let p = face.pitch?.doubleValue {
+                cachedPitch = p
+                vertical = p
+                verticalSource = "pitch"
+                consecutivePitchFrames += 1
+            } else {
+                let v = computeVerticalMetric(face)
+                cachedPitch = v.value
+                vertical = v.value
+                verticalSource = v.source
+                consecutivePitchFrames = 0
+            }
+            facing = headLikelyFacingCamera(face)
+            cachedFacing = facing
+            yaw = face.yaw?.doubleValue; cachedYaw = yaw
+            roll = face.roll?.doubleValue; cachedRoll = roll
+            lastAnglesAt = nowAngles
+        } else if let p = cachedPitch {
+            lastFaceSeen = Date()
+            vertical = p
+            verticalSource = "cached-pitch"
+            facing = cachedFacing
+            // See if current rectangles also have pitch to build confidence
+            if let pNow = baseFace.pitch?.doubleValue {
+                consecutivePitchFrames = min(consecutivePitchFrames + 1, requiredStablePitchFrames)
+                cachedPitch = pNow
+                vertical = pNow
+                verticalSource = "pitch"
+                yaw = baseFace.yaw?.doubleValue; cachedYaw = yaw
+                roll = baseFace.roll?.doubleValue; cachedRoll = roll
+                if let y = yaw, let r = roll { facing = abs(y) < 0.35 && abs(r) < 0.35 }
+                lastAnglesAt = nowAngles
+            }
+        }
+
+        if consecutivePitchFrames >= requiredStablePitchFrames { preferPitchMode = true }
+
         let lookingDown = vertical > pitchDownThreshold
 
         let faceFacingDown = true && facing && lookingDown
         evaluateLooking(faceFacingDown)
 
-        let yaw = face.yaw?.doubleValue
-        let roll = face.roll?.doubleValue
-        let dbg = "face: true | facing: \(facing) | down: \(lookingDown) | vert(\(verticalSource)): \(vertical) thr \(pitchDownThreshold) | yaw: \(yaw ?? .nan) | roll: \(roll ?? .nan)\nface&&facing&&down: \(faceFacingDown)"
-        onDebug?(dbg)
+        if let onDebug {
+            let dbg = "face: true | facing: \(facing) | down: \(lookingDown) | vert(\(verticalSource)): \(vertical) thr \(pitchDownThreshold) | yaw: \(yaw ?? .nan) | roll: \(roll ?? .nan)\nface&&facing&&down: \(faceFacingDown)"
+            onDebug(dbg)
+        }
+        }
     }
 
     private func computeVerticalMetric(_ face: VNFaceObservation) -> (value: Double, source: String) {
@@ -194,6 +278,8 @@ final class GazeController: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
             guard let self else { return }
             if Date().timeIntervalSince(self.lastFaceSeen) > 2.0 {
                 self.evaluateLooking(false)
+                self.preferPitchMode = false
+                self.consecutivePitchFrames = 0
             }
         }
     }
