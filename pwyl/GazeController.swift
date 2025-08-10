@@ -33,6 +33,7 @@ final class GazeController: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
     private var preferPitchMode: Bool = false
     private var consecutivePitchFrames: Int = 0
     private let requiredStablePitchFrames: Int = 3
+    private var lastFaceROI: CGRect? = nil
 
     // Smoothing / hysteresis
     private var lastLookingFlip = Date.distantPast
@@ -90,7 +91,13 @@ final class GazeController: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         if let device = input.device as? AVCaptureDevice {
             do {
                 try device.lockForConfiguration()
-                if device.activeFormat.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= 15 && 15 <= $0.maxFrameRate }) {
+                if device.activeFormat.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= 8 && 8 <= $0.maxFrameRate }) {
+                    device.activeVideoMinFrameDuration = CMTimeMake(value: 1, timescale: 8)
+                    device.activeVideoMaxFrameDuration = CMTimeMake(value: 1, timescale: 8)
+                } else if device.activeFormat.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= 10 && 10 <= $0.maxFrameRate }) {
+                    device.activeVideoMinFrameDuration = CMTimeMake(value: 1, timescale: 10)
+                    device.activeVideoMaxFrameDuration = CMTimeMake(value: 1, timescale: 10)
+                } else if device.activeFormat.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= 15 && 15 <= $0.maxFrameRate }) {
                     device.activeVideoMinFrameDuration = CMTimeMake(value: 1, timescale: 15)
                     device.activeVideoMaxFrameDuration = CMTimeMake(value: 1, timescale: 15)
                 }
@@ -103,6 +110,10 @@ final class GazeController: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         output.setSampleBufferDelegate(self, queue: videoQueue)
         guard session.canAddOutput(output) else { return false }
         session.addOutput(output)
+        if let conn = output.connection(with: .video) {
+            if conn.isVideoMinFrameDurationSupported { conn.videoMinFrameDuration = CMTimeMake(value: 1, timescale: 8) }
+            if conn.isVideoMaxFrameDurationSupported { conn.videoMaxFrameDuration = CMTimeMake(value: 1, timescale: 8) }
+        }
         session.commitConfiguration()
         return true
     }
@@ -115,6 +126,19 @@ final class GazeController: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         let now = Date()
         if now.timeIntervalSince(lastProcessedAt) < minProcessInterval { return }
         lastProcessedAt = now
+        // Narrow face rectangles search to last known ROI when recent
+        if let roi = lastFaceROI, now.timeIntervalSince(lastFaceSeen) < 1.5 {
+            func clamp(_ v: CGFloat) -> CGFloat { max(0, min(1, v)) }
+            let pad: CGFloat = 0.2
+            let r = roi
+            let expanded = CGRect(x: clamp(r.origin.x - pad * r.size.width),
+                                  y: clamp(r.origin.y - pad * r.size.height),
+                                  width: clamp(r.size.width * (1 + 2*pad)),
+                                  height: clamp(r.size.height * (1 + 2*pad)))
+            rectanglesRequest.regionOfInterest = expanded
+        } else {
+            rectanglesRequest.regionOfInterest = CGRect(x: 0, y: 0, width: 1, height: 1)
+        }
         do {
             try sequenceHandler.perform([rectanglesRequest], on: pixel, orientation: .up)
         } catch {
@@ -125,6 +149,7 @@ final class GazeController: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
             onDebug?("face: false\nface&&facing&&down: false")
             return
         }
+        lastFaceROI = baseFace.boundingBox
 
         var vertical: Double = 0
         var verticalSource = "cached"
