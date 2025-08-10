@@ -19,7 +19,9 @@ final class GazeController: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
     private let videoQueue = DispatchQueue(label: "lookpause.camera")
     private let rectanglesRequest = VNDetectFaceRectanglesRequest()
     private let landmarksRequest = VNDetectFaceLandmarksRequest()
-    private let qualityRequest = VNDetectFaceCaptureQualityRequest()
+    // Frame processing throttle
+    private var lastProcessedAt: Date = .distantPast
+    private let minProcessInterval: TimeInterval = 0.10
 
     // Smoothing / hysteresis
     private var lastLookingFlip = Date.distantPast
@@ -81,6 +83,9 @@ final class GazeController: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
         guard isEnabled, let pixel = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let now = Date()
+        if now.timeIntervalSince(lastProcessedAt) < minProcessInterval { return }
+        lastProcessedAt = now
         let handler = VNImageRequestHandler(cvPixelBuffer: pixel, orientation: .up, options: [:])
         do {
             try handler.perform([rectanglesRequest])
@@ -94,9 +99,8 @@ final class GazeController: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         }
 
         landmarksRequest.inputFaceObservations = [baseFace]
-        qualityRequest.inputFaceObservations = [baseFace]
         do {
-            try handler.perform([landmarksRequest, qualityRequest])
+            try handler.perform([landmarksRequest])
         } catch {
             evaluateLooking(false)
             onDebug?("face: yes | landmarks: error")
@@ -109,12 +113,6 @@ final class GazeController: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         }
         lastFaceSeen = Date()
 
-        // Capture quality in [0,1]; higher is better
-        let quality: Float = qualityRequest.results?.first?.faceCaptureQuality ?? 0
-
-        let earMetrics = computeEyeAspectRatio(face)
-        let earAvg = (earMetrics.left + earMetrics.right) / 2.0
-        let eyesOpen = earAvg > earOpenThreshold
         let facing = headLikelyFacingCamera(face)
         let (vertical, verticalSource) = computeVerticalMetric(face)
         let lookingDown = vertical > pitchDownThreshold
@@ -124,13 +122,8 @@ final class GazeController: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
 
         let yaw = face.yaw?.doubleValue
         let roll = face.roll?.doubleValue
-        let dbg = "face: true | facing: \(facing) | down: \(lookingDown) | eyesOpen: \(eyesOpen) | quality: \(String(format: "%.2f", quality)) | earL: \(String(format: "%.2f", earMetrics.left)) (n=\(earMetrics.leftCount)) | earR: \(String(format: "%.2f", earMetrics.right)) (n=\(earMetrics.rightCount)) | earAvg: \(String(format: "%.2f", earAvg)) | earThresh: \(String(format: "%.2f", earOpenThreshold)) | vert(\(verticalSource)): \(String(format: "%.2f", vertical)) thr \(String(format: "%.2f", pitchDownThreshold)) | yaw: \(String(format: "%.2f", yaw ?? .nan)) | roll: \(String(format: "%.2f", roll ?? .nan))\nface&&facing&&down: \(faceFacingDown)"
+        let dbg = "face: true | facing: \(facing) | down: \(lookingDown) | vert(\(verticalSource)): \(vertical) thr \(pitchDownThreshold) | yaw: \(yaw ?? .nan) | roll: \(roll ?? .nan)\nface&&facing&&down: \(faceFacingDown)"
         onDebug?(dbg)
-    }
-
-    private func eyesLikelyOpen(_ face: VNFaceObservation) -> Bool {
-        let earAvg = computeEyeAspectRatio(face).average
-        return earAvg > earOpenThreshold                 // tweakable threshold
     }
 
     private func computeVerticalMetric(_ face: VNFaceObservation) -> (value: Double, source: String) {
@@ -164,48 +157,6 @@ final class GazeController: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         let interOcular = sqrt(dx*dx + dy*dy)
         let metric = Double((noseCenter.y - eyeCenter.y) / max(interOcular, 0.001))
         return (metric, "landmarks")
-    }
-
-    private func computeEyeAspectRatio(_ face: VNFaceObservation) -> (left: Double, right: Double, average: Double, leftCount: Int, rightCount: Int) {
-        guard let left = face.landmarks?.leftEye, let right = face.landmarks?.rightEye else {
-            return (0, 0, 0, 0, 0)
-        }
-        func robustEAR(_ eye: VNFaceLandmarkRegion2D) -> (value: Double, count: Int) {
-            let points = (0..<eye.pointCount).map { eye.normalizedPoints[$0] }
-            let count = points.count
-            guard count >= 3 else { return (0, count) }
-            if count >= 8 {
-                let distance: (CGPoint, CGPoint) -> CGFloat = { a, b in
-                    let dx = a.x - b.x, dy = a.y - b.y
-                    return sqrt(dx*dx + dy*dy)
-                }
-                let horizontal = distance(points[0], points[4])
-                let v1 = distance(points[1], points[5])
-                let v2 = distance(points[2], points[6])
-                let v3 = distance(points[3], points[7])
-                let vertical = (v1 + v2 + v3) / 3
-                return (Double(vertical / max(horizontal, 0.001)), count)
-            } else {
-                // Fallback: use bounding box aspect ratio for the eye polygon
-                var minX = CGFloat.greatestFiniteMagnitude
-                var maxX = -CGFloat.greatestFiniteMagnitude
-                var minY = CGFloat.greatestFiniteMagnitude
-                var maxY = -CGFloat.greatestFiniteMagnitude
-                for p in points {
-                    if p.x < minX { minX = p.x }
-                    if p.x > maxX { maxX = p.x }
-                    if p.y < minY { minY = p.y }
-                    if p.y > maxY { maxY = p.y }
-                }
-                let horizontal = maxX - minX
-                let vertical = maxY - minY
-                return (Double(vertical / max(horizontal, 0.001)), count)
-            }
-        }
-        let l = robustEAR(left)
-        let r = robustEAR(right)
-        let avg = (l.value + r.value) / 2.0
-        return (l.value, r.value, avg, l.count, r.count)
     }
 
     private func headLikelyFacingCamera(_ face: VNFaceObservation) -> Bool {
