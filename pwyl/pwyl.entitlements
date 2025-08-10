@@ -6,5 +6,11 @@
 	<true/>
 	<key>com.apple.security.files.user-selected.read-only</key>
 	<true/>
+	<!-- Allow access to the built-in camera -->
+	<key>com.apple.security.device.camera</key>
+	<true/>
+	<!-- Allow sending Apple Events to Safari/Chrome for tab scripting -->
+	<key>com.apple.security.automation.apple-events</key>
+	<true/>
 </dict>
 </plist>
