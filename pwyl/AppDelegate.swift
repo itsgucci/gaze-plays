@@ -40,6 +40,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         debugConfig.threshold = controller.earOpenThreshold
+        // Proactively trigger Automation prompts for Safari/Chrome
+        controller.primeAutomationPermissions()
         controller.start()
     }
 

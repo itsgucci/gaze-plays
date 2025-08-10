@@ -38,6 +38,13 @@ final class GazeController: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
 
     private let youtube = YouTubeController()
 
+    override init() {
+        super.init()
+        youtube.onDebug = { [weak self] message in
+            self?.onDebug?(message)
+        }
+    }
+
     func start() {
         // Prefer the latest landmarks revision available to improve landmark quality
         if let latest = VNDetectFaceLandmarksRequest.supportedRevisions.last {
@@ -47,6 +54,10 @@ final class GazeController: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         session.startRunning()
         onStateChanged?(.idle)
         startWatchdog()
+    }
+
+    func primeAutomationPermissions() {
+        youtube.primeAutomationPermissions()
     }
 
     private func setupSession() -> Bool {
@@ -113,8 +124,6 @@ final class GazeController: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
 
         let yaw = face.yaw?.doubleValue
         let roll = face.roll?.doubleValue
-        let hasLeft = face.landmarks?.leftEye != nil
-        let hasRight = face.landmarks?.rightEye != nil
         let dbg = "face: true | facing: \(facing) | down: \(lookingDown) | eyesOpen: \(eyesOpen) | quality: \(String(format: "%.2f", quality)) | earL: \(String(format: "%.2f", earMetrics.left)) (n=\(earMetrics.leftCount)) | earR: \(String(format: "%.2f", earMetrics.right)) (n=\(earMetrics.rightCount)) | earAvg: \(String(format: "%.2f", earAvg)) | earThresh: \(String(format: "%.2f", earOpenThreshold)) | vert(\(verticalSource)): \(String(format: "%.2f", vertical)) thr \(String(format: "%.2f", pitchDownThreshold)) | yaw: \(String(format: "%.2f", yaw ?? .nan)) | roll: \(String(format: "%.2f", roll ?? .nan))\nface&&facing&&down: \(faceFacingDown)"
         onDebug?(dbg)
     }
